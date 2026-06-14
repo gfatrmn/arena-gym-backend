@@ -17,6 +17,9 @@ if (!$conn) {
     exit();
 }
 
+// Set zona waktu Asia/Jakarta agar sinkron dengan jam lokal HP Android kasir
+date_default_timezone_set('Asia/Jakarta');
+
 $path_folder = "member-photos/";
 if (!file_exists($path_folder)) {
     mkdir($path_folder, 0777, true);
@@ -36,10 +39,11 @@ switch ($mode) {
             $where_conditions[] = "(full_name LIKE '%$search%' OR phone LIKE '%$search%')";
         }
 
+        $current_time = date('Y-m-d H:i:s');
         if ($status_filter === 'active') {
-            $where_conditions[] = "(status = 'active' OR status = 'aktif' OR status = 'member')";
+            $where_conditions[] = "expires_at >= '$current_time'";
         } else if ($status_filter === 'inactive') {
-            $where_conditions[] = "(status = 'inactive' OR status = 'non-aktif' OR status = 'non_active')";
+            $where_conditions[] = "expires_at < '$current_time'";
         }
 
         $where_clause = "";
@@ -47,7 +51,11 @@ switch ($mode) {
             $where_clause = " WHERE " . implode(" AND ", $where_conditions);
         }
 
-        $sql = "SELECT id, full_name, email, phone, status, expires_at, profile_photo_path FROM gym_members" . $where_clause . " ORDER BY id DESC";
+        // FIXED: Mengubah urutan ORDER BY menggunakan updated_at DESC agar yang baru diperpanjang berada di paling atas list
+        $sql = "SELECT id, full_name, email, phone, status, expires_at, profile_photo_path, IFNULL(updated_at, created_at) AS sort_date 
+                FROM gym_members" . $where_clause . " 
+                ORDER BY sort_date DESC, id DESC";
+                
         $result = mysqli_query($conn, $sql);
         $data_list = array();
         
@@ -58,9 +66,9 @@ switch ($mode) {
         if ($result) {
             while ($row = mysqli_fetch_assoc($result)) {
                 if (!empty($row['profile_photo_path']) && file_exists($row['profile_photo_path'])) {
-                    $row['photo_url'] = $baseUrl . $row['profile_photo_path'];
+                    $row['profile_photo_path'] = $baseUrl . $row['profile_photo_path'];
                 } else {
-                    $row['photo_url'] = "";
+                    $row['profile_photo_path'] = "";
                 }
                 array_push($data_list, $row);
             }
@@ -101,8 +109,9 @@ switch ($mode) {
 
         $checkin_code = "AGM-" . strtoupper(substr(md5(time() . rand()), 0, 8));
 
-        $sql = "INSERT INTO gym_members (full_name, email, phone, checkin_code, profile_photo_path, joined_at, created_at, expires_at, status) 
-                VALUES ('$full_name', $email_db, $phone_db, '$checkin_code', $photo_db_path, CURDATE(), CURDATE(), DATE_ADD(CURDATE(), INTERVAL 1 MONTH), 'member')";
+        // Ditambahkan kolom updated_at diset NOW() saat insert awal agar data tidak null saat sorting pertama
+        $sql = "INSERT INTO gym_members (full_name, email, phone, checkin_code, profile_photo_path, joined_at, created_at, expires_at, updated_at, status) 
+                VALUES ('$full_name', $email_db, $phone_db, '$checkin_code', $photo_db_path, NOW(), NOW(), DATE_ADD(NOW(), INTERVAL 1 MONTH), NOW(), 'member')";
         
         if (mysqli_query($conn, $sql)) {
             echo json_encode(array("status" => "success", "message" => "Atlet baru berhasil disimpan (Aktif 1 Bulan)"));
@@ -123,6 +132,13 @@ switch ($mode) {
         $data_old = mysqli_fetch_assoc($res_old);
         $photo_db_path = $data_old['profile_photo_path'] ?? '';
 
+        if (!empty($photo_db_path) && strpos($photo_db_path, 'http') !== false) {
+            $parts = explode('/member-photos/', $photo_db_path);
+            if (isset($parts[1])) {
+                $photo_db_path = "member-photos/" . $parts[1];
+            }
+        }
+
         if (!empty($imstr) && !empty($file_name)) {
             if (!empty($photo_db_path) && file_exists($photo_db_path)) {
                 unlink($photo_db_path); 
@@ -136,7 +152,8 @@ switch ($mode) {
         $phone_db = !empty($phone) ? "'" . mysqli_real_escape_string($conn, $phone) . "'" : "NULL";
         $photo_db = !empty($photo_db_path) ? "'" . mysqli_real_escape_string($conn, $photo_db_path) . "'" : "NULL";
 
-        $sql = "UPDATE gym_members SET full_name='$full_name', email=$email_db, phone=$phone_db, profile_photo_path=$photo_db WHERE id='$id'";
+        // Ditambahkan updated_at = NOW() saat kasir melakukan edit profil biasa agar ikut naik ke atas list
+        $sql = "UPDATE gym_members SET full_name='$full_name', email=$email_db, phone=$phone_db, profile_photo_path=$photo_db, updated_at=NOW() WHERE id='$id'";
         
         if (mysqli_query($conn, $sql)) {
             echo json_encode(array("status" => "success", "message" => "Profil atlet berhasil diperbarui"));
@@ -148,7 +165,6 @@ switch ($mode) {
     case "renew":
         $id = mysqli_real_escape_string($conn, $_POST['id']);
         
-        // 1. Ambil nama member untuk keperluan data pencatatan transaksi kasir
         $res_member = mysqli_query($conn, "SELECT full_name FROM gym_members WHERE id = '$id'");
         $member_data = mysqli_fetch_assoc($res_member);
         
@@ -158,23 +174,19 @@ switch ($mode) {
         }
         
         $customer_name = mysqli_real_escape_string($conn, $member_data['full_name']);
-        
-        // 2. Generate kode invoice unik otomatis (Contoh: INV-20260613XXXX)
         $invoice = "INV-" . date('Ymd') . strtoupper(substr(md5(time() . rand()), 0, 4));
 
-        // 3. Mulai Database Transaction agar jika salah satu query gagal, data tidak rusak
         mysqli_begin_transaction($conn);
 
-        // Query A: Perbarui masa aktif di tabel gym_members
+        // KUNCI UTAMA: Ketika di-renew, updated_at di-update menjadi jam detik ini (NOW()). Sehingga kueri SELECT di atas akan membacanya sebagai data paling baru dan ditaruh paling atas.
         $sql_update_member = "UPDATE gym_members 
-                              SET expires_at = DATE_ADD(GREATEST(IFNULL(expires_at, CURDATE()), CURDATE()), INTERVAL 1 MONTH), 
+                              SET expires_at = DATE_ADD(GREATEST(IFNULL(expires_at, NOW()), NOW()), INTERVAL 1 MONTH), 
                                   status = 'member',
                                   updated_at = NOW() 
                               WHERE id = '$id'";
         
         $query_a_success = mysqli_query($conn, $sql_update_member);
 
-        // Query B: Masukkan log riwayat iuran Rp90.000 ke dalam tabel cashier_transactions (Sesuai struktur CMD Anda)
         $sql_insert_transaction = "INSERT INTO cashier_transactions 
                                    (invoice, gym_member_id, customer_name, transaction_group, transaction_type, amount, paid_amount, quantity, payment_method, payment_status, receipt_status, transaction_at, created_at, updated_at) 
                                    VALUES 
@@ -182,12 +194,11 @@ switch ($mode) {
         
         $query_b_success = mysqli_query($conn, $sql_insert_transaction);
 
-        // 4. Eksekusi pengecekan kesuksesan kedua query
         if ($query_a_success && $query_b_success) {
-            mysqli_commit($conn); // Simpan permanen ke database Laragon
+            mysqli_commit($conn);
             echo json_encode(array("status" => "success", "message" => "Masa aktif diperpanjang 1 bulan!"));
         } else {
-            mysqli_rollback($conn); // Batalkan semua jika ada yang gagal biar tidak error
+            mysqli_rollback($conn);
             echo json_encode(array("status" => "error", "message" => "Gagal perpanjang transaksi: " . mysqli_error($conn)));
         }
         break;
@@ -197,6 +208,13 @@ switch ($mode) {
         $res_photo = mysqli_query($conn, "SELECT profile_photo_path FROM gym_members WHERE id='$id'");
         $data_photo = mysqli_fetch_assoc($res_photo);
         $file_photo = $data_photo['profile_photo_path'] ?? '';
+
+        if (!empty($file_photo) && strpos($file_photo, 'http') !== false) {
+            $parts = explode('/member-photos/', $file_photo);
+            if (isset($parts[1])) {
+                $file_photo = "member-photos/" . $parts[1];
+            }
+        }
 
         if (!empty($file_photo) && file_exists($file_photo)) {
             unlink($file_photo); 
