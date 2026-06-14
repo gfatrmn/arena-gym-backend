@@ -12,6 +12,9 @@ if (!$conn) {
     exit();
 }
 
+// Set zona waktu agar NOW() sinkron dengan waktu lokal
+date_default_timezone_set('Asia/Jakarta');
+
 $mode = $_POST['mode'] ?? 'show';
 
 switch ($mode) {
@@ -21,10 +24,9 @@ switch ($mode) {
         
         if (!empty($search)) {
             $search = mysqli_real_escape_string($conn, $search);
-            $where_clause = " WHERE name LIKE '%$search%' OR category LIKE '%$search%'";
+            $where_clause = " WHERE name LIKE '%$search%' OR category LIKE '%$search%' OR brand LIKE '%$search%'";
         }
 
-        // SKU dan Description dihapus dari query SELECT
         $sql = "SELECT id, name, category, brand, price, stock, unit FROM products" . $where_clause . " ORDER BY id DESC";
         $result = mysqli_query($conn, $sql);
         $data_list = array();
@@ -50,7 +52,6 @@ switch ($mode) {
             exit();
         }
 
-        // Kolom sku & description dikosongkan (NULL / default value bawaan database)
         $sql = "INSERT INTO products (name, category, brand, price, stock, unit, is_active, created_at, updated_at) 
                 VALUES ('$name', '$category', '$brand', $price, $stock, '$unit', 1, NOW(), NOW())";
 
@@ -70,6 +71,11 @@ switch ($mode) {
         $stock = (int)($_POST['stock'] ?? 0);
         $unit = mysqli_real_escape_string($conn, $_POST['unit'] ?? 'pcs');
 
+        if (empty($id)) {
+            echo json_encode(array("status" => "error", "message" => "ID produk tidak valid untuk update!"));
+            exit();
+        }
+
         $sql = "UPDATE products SET name='$name', category='$category', brand='$brand', price=$price, stock=$stock, unit='$unit', updated_at=NOW() WHERE id='$id'";
 
         if (mysqli_query($conn, $sql)) {
@@ -81,12 +87,18 @@ switch ($mode) {
 
     case "delete":
         $id = mysqli_real_escape_string($conn, $_POST['id'] ?? '');
+        
+        if (empty($id)) {
+            echo json_encode(array("status" => "error", "message" => "ID produk tidak ditemukan!"));
+            exit();
+        }
+
         $sql = "DELETE FROM products WHERE id='$id'";
 
         if (mysqli_query($conn, $sql)) {
             echo json_encode(array("status" => "success", "message" => "Produk berhasil dihapus"));
         } else {
-            echo json_encode(array("status" => "error", "message" => "Gagal menghapus produk"));
+            echo json_encode(array("status" => "error", "message" => "Gagal menghapus produk: " . mysqli_error($conn)));
         }
         break;
 }
